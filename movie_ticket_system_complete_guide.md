@@ -1,75 +1,248 @@
-# Complete Technical Architecture Guide
-**Movie Ticket Booking System (LLD)**
+# Master Guide: Movie Ticket Booking System (LLD)
+
+Welcome to the complete Low-Level Design documentation for the Movie Ticket Booking Engine. This guide acts as your single source of truth for understanding the system's architecture, concurrency models, data flows, and UML diagrams. 
+
+To best grasp the engine's design, **read this document in the order presented below**, as concepts build upon one another sequentially.
 
 ---
 
-## 1. Executive Summary
-This document serves as the master guide to the Low-Level Design (LLD) of the Movie Ticket Booking Engine. It breaks down the entire lifecycle of a ticket booking operation—from how cinemas and screens are modeled, to how shows are instantiated without overlapping seat histories, to the hardcore concurrency locks preventing double-bookings. It also transparently addresses the bounds of this project (what is intentionally lacking, such as admin scheduling overlap prevention).
+## 📖 Table of Contents (Recommended Learning Path)
+1. **[Core Rules & System Philosophy](#1-core-rules--system-philosophy)** - Understand *why* we don't clear seats.
+2. **[Domain Models & Entity Relationships](#2-domain-models--entity-relationships)** - The physical vs. event models.
+3. **[UML Class Diagram & Blueprint](#3-uml-class-diagram--blueprint)** - How the components wire together visually.
+4. **[Seat State Transitions (UML)](#4-seat-state-transitions-uml)** - Rules determining seat eligibility.
+5. **[Concurrency Engine: How We Stop Double-Booking](#5-concurrency-engine-how-we-stop-double-booking)** - The exact thread-safety logic.
+6. **[Background Lock Expiration Daemon](#6-background-lock-expiration-daemon)** - Automated memory cleanup mapping.
+7. **[API Booking Flow Sequence (UML)](#7-api-booking-flow-sequence-uml)** - Step-by-step transaction walkthrough.
+8. **[Design Patterns Leveraged](#8-design-patterns-leveraged)** - OOP practices for dynamic pricing.
+9. **[Boundary Constraints (What is Lacking)](#9-boundary-constraints-what-is-lacking)** - Transitioning this to Cloud Architecture.
+10. **[Edge Cases & Real-World Output](#10-edge-cases--real-world-output)** - Console execution evidence.
 
 ---
 
-## 2. Core Domain Models & Entity Relationships
+## 1. Core Rules & System Philosophy
+Before examining the code, you must understand the two unbending rules defining modern theatrical booking engines:
 
-The system is built on highly decoupled Java objects to simulate a real-world theatre environment.
+### Rule A: "The No-Resetting Rule" (The `Show` Object)
+A common beginner mistake is assuming that when a movie ends at 12:00 PM, a script loops over the 500 seats and sets their statuses from `BOOKED` back to `AVAILABLE` for the 1:00 PM movie.
+**We do not do this because it destroys structural history.**
+Instead, the layout of seats is mapped directly to a distinct `Show` instance. 
+* The 10:00 AM *Avengers* Show has its own unique Map of brand new Seat objects.
+* The 1:00 PM *Spiderman* Show (even if on the same physical Screen) generates a completely independent `Show` array of new Seat objects.
+* This isolated spawning protects transactional accounting and eliminates cross-movie interference.
 
-### 2.1 The Infrastructure Models
-* **[Theatre](file:///e:/Projects/MovieTicketBookingSystem/src/model/Theatre.java#3-20)**: The physical cinema building (e.g., "PVR Cinemas, Mall of America"). Holds an ID and a Name.
-* **[Screen](file:///e:/Projects/MovieTicketBookingSystem/src/model/Screen.java#3-20)**: An individual auditorium within the Theatre. Belongs to exactly 1 [Theatre](file:///e:/Projects/MovieTicketBookingSystem/src/model/Theatre.java#3-20).
-
-### 2.2 The Scheduling Models (The Event)
-* **[Show](file:///e:/Projects/MovieTicketBookingSystem/src/model/Show.java#7-49)**: This is the most crucial class in the architecture. A [Show](file:///e:/Projects/MovieTicketBookingSystem/src/model/Show.java#7-49) represents a specific Movie airing on a specific [Screen](file:///e:/Projects/MovieTicketBookingSystem/src/model/Screen.java#3-20) at a specific `LocalDateTime` (e.g., "Avengers", Screen 1, 10:00 AM).
-  * **Critical Architecture Rule (No Seat Resetting)**: A [Show](file:///e:/Projects/MovieTicketBookingSystem/src/model/Show.java#7-49) holds its own internal, thread-safe `ConcurrentHashMap` of [Seat](file:///e:/Projects/MovieTicketBookingSystem/src/model/Seat.java#3-30) objects. When a movie finishes, the system **does not** "reset" the seats from BOOKED to AVAILABLE. Doing so would destroy the historical booking data. Instead, when the 1:00 PM movie begins, the system generates a **completely new [Show](file:///e:/Projects/MovieTicketBookingSystem/src/model/Show.java#7-49) object** loaded with a brand new map of clean [Seat](file:///e:/Projects/MovieTicketBookingSystem/src/model/Seat.java#3-30) objects. 
-  * This guarantees 10:00 AM bookings never interfere with 1:00 PM bookings, and historical data remains immutable.
-
-### 2.3 The transactional Models
-* **[Seat](file:///e:/Projects/MovieTicketBookingSystem/src/model/Seat.java#3-30)**: An individual chair inside the [Show](file:///e:/Projects/MovieTicketBookingSystem/src/model/Show.java#7-49) map. It holds an Enum `SeatType` (VIP, REGULAR) and an Enum `SeatStatus` (AVAILABLE, LOCKED, BOOKED).
-* **[SeatLock](file:///e:/Projects/MovieTicketBookingSystem/src/model/SeatLock.java#5-36)**: A temporary security object linking a [Seat](file:///e:/Projects/MovieTicketBookingSystem/src/model/Seat.java#3-30) to a [User](file:///e:/Projects/MovieTicketBookingSystem/src/model/Booking.java#24-27) for a fixed duration of time (e.g., 5 minutes) via `Instant` timestamps.
-* **[Booking](file:///e:/Projects/MovieTicketBookingSystem/src/model/Booking.java#5-40)**: The final receipt object permanently binding the User to their [Seats](file:///e:/Projects/MovieTicketBookingSystem/src/model/Booking.java#32-35) with the final financial total attached.
+### Rule B: "Strict Locking Pipeline"
+Seats cannot instantly jump from `AVAILABLE` ➔ `BOOKED`. They **must** be `LOCKED` first to act as a defensive buffer while the user is inside actual payment pipelines.
 
 ---
 
-## 3. The Core Booking Mechanisms
+## 2. Domain Models & Entity Relationships
 
-### 3.1 Resolving Concurrency (Double-Booking Prevention)
-The massive challenge of ticketing is stopping two users from clicking the identical seat at the identical millisecond. 
-* **The Solution**: We utilize **Seat-Level Monitor Locking** (`synchronized (seat)`).
-* **How it works**: By synchronizing against the target `seat` memory object instance, if User A and User B concurrently target Seat `A1`, the JVM forces them into a single-file line physically. User A checks the status, flips it to `LOCKED`, and finishes. User B then executes, checks the status, sees it is now `LOCKED`, and receives a clean [SeatLockException](file:///e:/Projects/MovieTicketBookingSystem/src/exception/SeatLockException.java#3-8) rejection.
-* **Why it scales**: Because the lock is bound to `A1`, User C can book `A2` simultaneously with absolutely zero CPU interference.
+The architecture separates Physical real-estate from Time-based events:
 
-### 3.2 Automated Time-Based Lock Sweeping
-When a lock is acquired, the user must pay. If their payment fails or they leave the webpage, the lock must expire.
-* **The Solution**: A `ScheduledExecutorService` (Background Daemon Thread).
-* **How it works**: A background thread spins continuously every 1 second in the [SeatLockService](file:///e:/Projects/MovieTicketBookingSystem/src/service/SeatLockService.java#16-105). It quietly traverses all active lock caches. If it finds a [SeatLock](file:///e:/Projects/MovieTicketBookingSystem/src/model/SeatLock.java#5-36) where the `expirationTime` has passed the `Instant.now()`, the daemon forcefully strips the lock and reverts the actual [Seat](file:///e:/Projects/MovieTicketBookingSystem/src/model/Seat.java#3-30) back to `AVAILABLE`.
+### Physical Entities
+* **`Theatre`**: The physical cinema building (e.g., "PVR Cinemas"). Holds a list of spatial identifiers.
+* **`Screen`**: An individual auditorium within the Theatre. Belongs to exactly 1 `Theatre`.
 
-### 3.3 Dynamic Pricing Calculations
-* **The Solution**: The Strategy Design Pattern ([PricingStrategy](file:///e:/Projects/MovieTicketBookingSystem/src/strategy/PricingStrategy.java#6-9)).
-* **How it works**: Pricing isn't hardcoded. Depending on the day or event, the system injects a strategy (like [WeekendPricingStrategy](file:///e:/Projects/MovieTicketBookingSystem/src/strategy/WeekendPricingStrategy.java#6-21) or [RegularPricingStrategy](file:///e:/Projects/MovieTicketBookingSystem/src/strategy/RegularPricingStrategy.java#6-21)) which calculates the final fee based on the individual `SeatType` variations. This obeys the **Open-Closed Principle**, allowing future strategies (e.g. `MatineeDiscountStrategy`) to be added without touching core business logic.
+### Event Entities
+* **`Show` (The Hub Node)**: An occurrence pairing a Movie to a `Screen` at a `LocalDateTime`. It contains a `Map<String, Seat>` backed by a `ConcurrentHashMap`. This provides lock-stripped concurrency ensuring Thread A accessing Seat 1 does not freeze Thread B accessing Seat 2.
 
----
-
-## 4. Boundary Limits & "What is Lacking"
-This project focuses intensely on the **Booking & Concurrency Engine**. Therefore, certain administrative boundaries were intentionally omitted. If adapting this to a full-stack, real-world application, the following would be required:
-
-### 4.1 Missing: Screen Scheduling Overlap Prevention
-* **Current State**: The system accurately ties a [Show](file:///e:/Projects/MovieTicketBookingSystem/src/model/Show.java#7-49) to a [Screen](file:///e:/Projects/MovieTicketBookingSystem/src/model/Screen.java#3-20). However, there is no validation preventing an Administrator from scheduling two different [Show](file:///e:/Projects/MovieTicketBookingSystem/src/model/Show.java#7-49) objects on the identical [Screen](file:///e:/Projects/MovieTicketBookingSystem/src/model/Screen.java#3-20) at the identical time. 
-* **Required Fix**: If building the `TheatreAdminService`, whenever a new [Show](file:///e:/Projects/MovieTicketBookingSystem/src/model/Show.java#7-49) is instantiated, the system must query the [Screen](file:///e:/Projects/MovieTicketBookingSystem/src/model/Screen.java#3-20)'s existing list of Shows. It must check if `newShow.startTime` occurs before [(existingShow.startTime + movieDuration)](file:///e:/Projects/MovieTicketBookingSystem/src/model/Show.java#7-49). If an overlap exists, it should throw a `ScheduleConflictException`.
-
-### 4.2 Missing: Persistent Database State
-* **Current State**: All mapping, locking, and seating is tracked natively in standard JVM memory (RAM). When the Java program terminates, the data is lost.
-* **Required Fix**: Move state mutations (like `seat.setStatus(BOOKED)`) into transactional **ACID Relational Database** queries (PostgreSQL / MySQL) utilizing row-level locks (`SELECT ... FOR UPDATE`).
-
-### 4.3 Missing: Distributed Locks
-* **Current State**: `synchronized (seat)` works flawlessly for a single local server running Java.
-* **Required Fix**: If scaling to a massive server cluster (e.g., 10 API instances running simultaneously), a local synchronized block won't stop Server 1 from booking the same seat as Server 2. You must implement a **Distributed Caching Lock** layer, utilizing technology such as **Redis** (via Redisson) to lock unique String identifiers (e.g., `LOCK_SHOW1_SEAT_A1`) globally across the cloud.
+### Transaction Entities
+* **`Seat`**: The individual interactive unit, containing its `SeatType` (VIP, Regular) and current `SeatStatus`.
+* **`SeatLock`**: A volatile mapping object linking a `Seat` ➔ `Show` ➔ `UserId` for a temporary `Instant` execution window.
+* **`Booking`**: The immutable, final receipt permanently binding the user to the seats containing the financial execution total.
 
 ---
 
-## 5. Master API Execution Flow (The User Journey)
+## 3. UML Class Diagram & Blueprint
 
-1. **User Request**: HTTP Payload requests [bookSeats()](file:///e:/Projects/MovieTicketBookingSystem/src/service/BookingService.java#25-74) containing Show ID `SHOW1` and designated Seat IDs `["A1", "A2"]`.
-2. **Entity Validation**: System queries `SHOW1` and extracts references to the real memory [Seat](file:///e:/Projects/MovieTicketBookingSystem/src/model/Seat.java#3-30) objects. It verifies the seats physically exist.
-3. **Lock Acquisition Request**: [BookingService](file:///e:/Projects/MovieTicketBookingSystem/src/service/BookingService.java#16-75) delegates to [SeatLockService](file:///e:/Projects/MovieTicketBookingSystem/src/service/SeatLockService.java#16-105).
-4. **Transaction Attempt**: [SeatLockService](file:///e:/Projects/MovieTicketBookingSystem/src/service/SeatLockService.java#16-105) seizes the intrinsic thread monitor for `Seat A1`. It verifies the state is `AVAILABLE`. The state structurally mutates to `LOCKED`. An expiring timer is assigned to it inside the cache map.
-5. **Simulated Payment Latency**: System thread sleeps momentarily, simulating external payment gateway routing.
-6. **Confirmation Verification**: Before locking the receipt, [BookingService](file:///e:/Projects/MovieTicketBookingSystem/src/service/BookingService.java#16-75) runs [validateLock()](file:///e:/Projects/MovieTicketBookingSystem/src/service/SeatLockService.java#73-81) against the cache. This ensures the background Daemon Sweeper thread did not strip the lock due to a timeout while the user was traversing the payment gateway.
-7. **Finalization Makeover**: If valid, [confirmLock()](file:///e:/Projects/MovieTicketBookingSystem/src/service/SeatLockService.java#52-60) permanently deletes the temporary lock mappings. The [Seat](file:///e:/Projects/MovieTicketBookingSystem/src/model/Seat.java#3-30) physically mutates into `BOOKED`. [PricingStrategy](file:///e:/Projects/MovieTicketBookingSystem/src/strategy/PricingStrategy.java#6-9) totals the amount. A [Booking](file:///e:/Projects/MovieTicketBookingSystem/src/model/Booking.java#5-40) receipt object is formulated and returned to the client controller.
+Below is the relationship tree visually representing the code components mapping to each other. 
+
+```mermaid
+classDiagram
+    class Theatre {
+        -String id
+        -String name
+    }
+    class Screen {
+        -String id
+        -Theatre theatre
+    }
+    class Show {
+        -String id
+        -String movieId
+        -Screen screen
+        -LocalDateTime startTime
+        -Map~String, Seat~ seats
+    }
+    class Seat {
+        -String id
+        -SeatType type
+        -SeatStatus status
+    }
+    class SeatLock {
+        -Seat seat
+        -Show show
+        -String userId
+        -Instant lockTime
+        -Instant expirationTime
+    }
+    
+    Theatre "1" --> "*" Screen : contains
+    Screen "1" --> "*" Show : hosts
+    Show "1" --> "*" Seat : has layout mapping
+    SeatLock "0..1" --> "1" Seat : dynamically locks
+```
+
+---
+
+## 4. Seat State Transitions (UML)
+
+This state machine controls what operations are legally allowed on a seat. Note the absolute inability for a user to move directly from `AVAILABLE` to `BOOKED`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> AVAILABLE
+    
+    AVAILABLE --> LOCKED : User initiates booking (Acquires concurrency monitor)
+    
+    LOCKED --> BOOKED : Payment confirmed & validateLock() passes
+    
+    LOCKED --> AVAILABLE : Payment fails OR Background Sweeper detects lock.isExpired()
+    
+    BOOKED --> [*]
+```
+
+---
+
+## 5. Concurrency Engine: How We Stop Double-Booking
+
+Preventing race conditions is the primary technical accomplishment of this architecture.
+If 100 people click the exact same seat at the exact same millisecond, how does the program decide a winner without crashing?
+
+### The Solution: Granular Object-Level Monitors
+We do not use high-level function locks (`public synchronized void bookSeat()`), which would force a single-file line across the *entire* theatre, crippling performance. 
+We synchronize explicitly against the actual **target memory block (the individual `Seat` object itself)**.
+
+```java
+// Inside SeatLockService.java
+private void lockSeat(Show show, Seat seat, String userId, int timeoutInSeconds) {
+    synchronized (seat) {
+        if (seat.getStatus() == SeatStatus.AVAILABLE) {
+            seat.setStatus(SeatStatus.LOCKED);
+            // Formulate new SeatLock object and cache it
+        } else {
+            // Throw exception rejecting parallel attackers
+            throw new SeatLockException("Seat " + seat.getId() + " is already " + seat.getStatus());
+        }
+    }
+}
+```
+**The Mechanics**:
+1. Threads A and B target `Seat A1`. The JVM hands the intrinsic lock entirely to Thread A. Thread B hits a wait state. 
+2. Thread A verifies `AVAILABLE`, flips it to `LOCKED`, and escapes. 
+3. Thread B enters, verifies, sees it is now `LOCKED`, and gets violently but cleanly rejected via a `SeatLockException`.
+4. *Meanwhile*, Thread C wants `Seat A2`. Because `A2` is a physically different object memory reference, Thread C runs completely parallel to Thread A without ever hitting a queue.
+
+---
+
+## 6. Background Lock Expiration Daemon
+
+Seats locked but never paid for must be recovered automatically.
+We opted for Active Eviction over Lazy Eviction via a **Scheduled Daemon Thread**.
+
+Inside `SeatLockService`, a `ScheduledExecutorService` creates a secondary background thread ticking silently every 1 second. 
+It traverses the entire `ConcurrentHashMap` of active lock mappings. If `lock.isExpired()` returns true, it forcefully breaks the tie and restores the `Seat` back to `AVAILABLE`. 
+
+By wrapping this iterator logic in a `try-catch(Throwable)` block, we guarantee the sweeper thread never randomly dies leaving "zombie locked seats" dangling inside the application.
+
+---
+
+## 7. API Booking Flow Sequence (UML)
+
+This diagram demonstrates the flow of time and object routing when a User initiates an end-to-end booking. 
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant BookingService
+    participant SeatLockService
+    participant Seat as Seat (Memory Object)
+    participant PricingStrategy
+
+    User->>BookingService: bookSeats(show, ["A1", "A2"], "User-1")
+    BookingService->>SeatLockService: lockSeats(show, seats, "User-1")
+    
+    SeatLockService->>Seat: synchronized(seat) -> acquire object monitor
+    Seat-->>SeatLockService: Returns mutation success, state is LOCKED
+    SeatLockService-->>BookingService: Valid. Locking completed.
+    
+    Note over BookingService: JVM Thread Pause: Network simulation for payment gateway confirmation
+    
+    BookingService->>SeatLockService: validateLock(seat) (Ensures background daemon hasn't deleted it)
+    SeatLockService->>Seat: confirmLock() (Removes time mapping from daemon)
+    Seat-->>BookingService: Valid, mutate to BOOKED
+    
+    BookingService->>PricingStrategy: calculatePrice(seat, show)
+    PricingStrategy-->>BookingService: Returns exact total float
+    BookingService-->>User: Issues final `Booking` object receipt!
+```
+
+---
+
+## 8. Design Patterns Leveraged
+
+Aside from structural decoupling, architectural flexibility is maintained using formal GoF design patterns:
+
+### Strategy Pattern (Dynamic Pricing)
+Prices vary based on weekends, matinees, holidays, and seat tiers. Instead of burying massive `switch-case` IF/ELSE logic blocks deep inside the `BookingService` that require constant rewriting, pricing was abstracted cleanly into an isolated Interface template (`PricingStrategy.java`).
+
+By cleanly passing a `WeekendPricingStrategy` concrete object into the system configuration, the engine dynamically recalculates totals strictly according to the Open-Closed Principle.
+
+---
+
+## 9. Boundary Constraints (What is Lacking)
+This repository purposely isolates strictly the concurrency locking constraints of ticketing logic. If deploying this application to the actual cloud (AWS/GCP), be prepared to address the following interview transitions:
+
+### Missing: Scale to Distributed Processing
+* **Current Issue**: `synchronized(seat)` works flawlessly on a solitary running JVM server. But if 10 independent servers handle user-traffic globally, a JVM monitor won't stop Server 1 and Server 2 from colliding.
+* **The Transition**: The local `ConcurrentHashMap` object locks must be ripped out and replaced with **Redis Distributed Caches** tracking TTL natively, accompanied by **Zookeeper / Redisson Distributed Locks** guaranteeing multi-server singularity.
+
+### Missing: Administrative Multi-Scheduling Defenses
+* **Current Issue**: An admin could blindly inject two distinct `Shows` on the identical `Screen` object overlapping the exact same timeframe.
+* **The Transition**: An external `AdminService` API must be composed that intercepts `createShow()` commands. By writing a time-boundary check (`newShow.startTime` must not intersect `existingShow.startTime` + `movieDuration`), spatial overlaps are rejected natively.
+
+---
+
+## 10. Edge Cases & Real-World Output
+
+Our execution script natively tests the worst-case scenario. When `Main.java` is executed natively, it creates a 10-thread thread-pool and throws all 10 users at Seat "A1" perfectly simultaneously simulating a DDOS-style user collision. 
+
+**Simulation Execution Output:**
+```text
+--- Starting Movie Ticket Booking System Simulation ---
+10 users trying to book Seat A1 at the exact same time.
+
+User [User-3] successfully locked seats: [A1]
+User [User-9] Exception: Seat A1 is already LOCKED
+User [User-8] Exception: Seat A1 is already LOCKED
+User [User-4] Exception: Seat A1 is already LOCKED
+User [User-10] Exception: Seat A1 is already LOCKED
+User [User-6] Exception: Seat A1 is already LOCKED
+User [User-1] Exception: Seat A1 is already LOCKED
+User [User-5] Exception: Seat A1 is already LOCKED
+User [User-2] Exception: Seat A1 is already LOCKED
+User [User-7] Exception: Seat A1 is already LOCKED
+
+Booking Confirmed! ✅ ID: d347214a-4fa3... | By: User-3 | Total: Rs.250.0
+Seat A1 Final Status: BOOKED
+
+User-X trying to lock Seat A2, but won't book it.
+Seat A2 Status after lock attempt: LOCKED
+Waiting 12 seconds for lock to expire automatically...
+[System]: Lock expired and released for seat: A2 at Show SHOW1
+Seat A2 Status after wait: AVAILABLE
+
+--- Simulation complete ---
+```
+Every edge-case resolves deterministically and cleanly. The Background timeouts resolve cleanly asynchronously.
