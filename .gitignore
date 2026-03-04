@@ -1,0 +1,15 @@
+# Compiled output
+out/
+*.class
+
+# Log files
+*.log
+output.txt
+error.txt
+
+# IDEs and editors
+.idea/
+*.iml
+.vscode/
+*.swp
+.DS_Store
