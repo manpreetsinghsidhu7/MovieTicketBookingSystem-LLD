@@ -25,7 +25,6 @@ public class BookingService {
     public Booking bookSeats(Show show, List<String> seatIds, String userId) {
         List<Seat> seatsToBook = new ArrayList<>();
 
-        // validate seats
         for (String seatId : seatIds) {
             Seat seat = show.getSeat(seatId);
             if (seat == null) {
@@ -34,18 +33,15 @@ public class BookingService {
             seatsToBook.add(seat);
         }
 
-        // lock the seats
         seatLockService.lockSeats(show, seatsToBook, userId);
         System.out.println("User [" + userId + "] successfully locked seats: " + seatIds);
 
-        // simulate payment delay
         try {
             Thread.sleep(100);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
 
-        // confirm booking
         double totalAmount = 0.0;
         List<Seat> bookedSeats = new ArrayList<>();
 
@@ -54,7 +50,6 @@ public class BookingService {
                 if (!seatLockService.validateLock(show, seat, userId)) {
                     System.err.println("User [" + userId + "] lock invalid or expired for seat " + seat.getId()
                             + ". Rolling back.");
-                    // rollback missing lock
                     seatLockService.unlockSeats(show, seatsToBook, userId);
                     throw new SeatLockException("Lock expired for seat: " + seat.getId() + ". Booking failed!");
                 }
@@ -68,7 +63,7 @@ public class BookingService {
 
         Booking booking = new Booking(UUID.randomUUID().toString(), userId, show, bookedSeats, totalAmount);
         System.out.println(
-                "Booking Confirmed! ✅ ID: " + booking.getId() + " | By: " + userId + " | Total: Rs." + totalAmount);
+                "Booking Confirmed! --- ID: " + booking.getId() + " | By: " + userId + " | Total: Rs." + totalAmount);
         return booking;
     }
 }
